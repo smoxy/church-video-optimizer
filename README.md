@@ -22,7 +22,6 @@ A high-efficiency, containerized microservice for automated video optimization u
 - `internal/fetcher`: HTTP client and download logic.
 - `internal/extractor`: Zip extraction with "Zip Slip" protection.
 - `internal/processor`: FFmpeg wrapper.
-- `internal/queue`: Buffered job queue.
 
 ## Configuration
 
@@ -34,7 +33,7 @@ The service is configured entirely via environment variables:
 | `OUTPUT_ROOT` | Path to mount the partial volume. | `/data/output` |
 | `POLLING_INTERVAL` | Seconds between poll cycles. | `300` |
 | `VIDEO_CODEC` | Target video codec (e.g., `libx265`, `libsvtav1`). | `libx265` |
-| `VIDEO_CRF` | Content Rate Factor (Quality). Lower is better. | `28` |
+| `VIDEO_CRF` | Content Rate Factor (Quality). Lower is better. | `27` |
 | `MAX_THREADS` | Max CPU threads for FFmpeg (0 = auto). | `0` |
 
 ## Deployment

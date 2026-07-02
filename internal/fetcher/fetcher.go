@@ -122,7 +122,7 @@ func (f *Fetcher) Download(urlStr string, dest string) error {
 	}
 	headResp.Body.Close()
 
-	if headResp.StatusCode != http.StatusOK && headResp.StatusCode != http.StatusOK {
+	if headResp.StatusCode != http.StatusOK && headResp.StatusCode != http.StatusPartialContent {
 		return fmt.Errorf("HEAD request failed: %d", headResp.StatusCode)
 	}
 
