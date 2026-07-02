@@ -231,6 +231,112 @@ func TestJobsForItem_ZipWithoutVideos_SkipsAndLogsWarning(t *testing.T) {
 	}
 }
 
+// TestJobsForItem_ZipWithNestedVideos_FindsAllAtAnyDepthInDeterministicOrder
+// covers the categorie-video-non-mappate backlog (owner decision
+// 2026-07-02): video search must be recursive over the whole extracted
+// tree, not just the zip's top level, and the resulting "n" (Job.Index)
+// must be stable/reproducible rather than following the archive's own
+// (unspecified) entry order. Entries are written in an order that is
+// neither alphabetical nor depth-first so the assertion can't pass by
+// accident, and the category ("scuola") is one the backlog explicitly
+// calls out as unmapped/never filtered.
+func TestJobsForItem_ZipWithNestedVideos_FindsAllAtAnyDepthInDeterministicOrder(t *testing.T) {
+	tmpDir := t.TempDir()
+	zipPath := filepath.Join(tmpDir, "archive.zip")
+	extractDir := filepath.Join(tmpDir, "extract")
+
+	buildOrderedZip(t, zipPath, []zipEntry{
+		{name: "z-top.mp4", content: "top-z"},
+		{name: "sub/a-nested.mkv", content: "nested-a"},
+		{name: "sub/deep/b-deep.mp4", content: "deep-b"},
+		{name: "cover.jpg", content: "not-a-video"},
+		{name: "sub/notes.txt", content: "not-a-video-either"},
+	})
+
+	item := fetcher.FileItem{
+		URL:        "https://example.com/download/archive.zip",
+		Filename:   "archive.zip",
+		ResourceID: 7,
+		Category:   "scuola",
+		Title:      "Lezione",
+	}
+
+	jobs, err := jobsForItem(item, zipPath, extractDir)
+	if err != nil {
+		t.Fatalf("jobsForItem() error = %v", err)
+	}
+	if len(jobs) != 3 {
+		t.Fatalf("expected 3 jobs (only videos, found at any depth), got %d: %+v", len(jobs), jobs)
+	}
+
+	// Sorted order over the full extracted tree, not the archive's entry order.
+	wantLocalPaths := []string{
+		filepath.Join(extractDir, "sub", "a-nested.mkv"),
+		filepath.Join(extractDir, "sub", "deep", "b-deep.mp4"),
+		filepath.Join(extractDir, "z-top.mp4"),
+	}
+	wantOriginalFilenames := []string{"a-nested.mkv", "b-deep.mp4", "z-top.mp4"}
+
+	for i, job := range jobs {
+		if job.LocalPath != wantLocalPaths[i] {
+			t.Errorf("jobs[%d].LocalPath = %q, want %q", i, job.LocalPath, wantLocalPaths[i])
+		}
+		if job.OriginalFilename != wantOriginalFilenames[i] {
+			t.Errorf("jobs[%d].OriginalFilename = %q, want %q (base name only, nested folders must not leak in)", i, job.OriginalFilename, wantOriginalFilenames[i])
+		}
+		if job.Index != i+1 {
+			t.Errorf("jobs[%d].Index = %d, want %d (stable progressive n)", i, job.Index, i+1)
+		}
+		if job.Category != "scuola" {
+			t.Errorf("jobs[%d].Category = %q, want %q (categories are open, adr-0008: no filter)", i, job.Category, "scuola")
+		}
+	}
+}
+
+// TestJobsForItem_ZipWithNestedZipEntry_IgnoresItButProcessesSiblingVideos
+// covers the explicit non-goal (categorie-video-non-mappate backlog):
+// zip-in-zip is not supported. A nested zip entry, at any depth, must be
+// skipped and logged rather than extracted, while real videos elsewhere in
+// the same archive are still turned into jobs normally.
+func TestJobsForItem_ZipWithNestedZipEntry_IgnoresItButProcessesSiblingVideos(t *testing.T) {
+	tmpDir := t.TempDir()
+	zipPath := filepath.Join(tmpDir, "archive.zip")
+	extractDir := filepath.Join(tmpDir, "extract")
+
+	buildOrderedZip(t, zipPath, []zipEntry{
+		{name: "sub/inner.zip", content: "not-really-opened-as-an-archive"},
+		{name: "video.mp4", content: "real-video"},
+	})
+
+	item := fetcher.FileItem{
+		URL: "https://example.com/d/archive.zip", Filename: "archive.zip",
+		ResourceID: 3, Category: "vga",
+	}
+
+	var logBuf bytes.Buffer
+	defer captureSlog(&logBuf)()
+
+	jobs, err := jobsForItem(item, zipPath, extractDir)
+	if err != nil {
+		t.Fatalf("jobsForItem() error = %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 job (nested zip ignored, sibling video kept), got %d: %+v", len(jobs), jobs)
+	}
+	if jobs[0].OriginalFilename != "video.mp4" {
+		t.Errorf("jobs[0].OriginalFilename = %q, want %q", jobs[0].OriginalFilename, "video.mp4")
+	}
+
+	if _, err := os.Stat(filepath.Join(extractDir, "sub", "inner.zip")); !os.IsNotExist(err) {
+		t.Errorf("expected the nested zip to never be extracted to disk, stat err: %v", err)
+	}
+
+	logged := logBuf.String()
+	if !strings.Contains(logged, "WARN") || !strings.Contains(logged, "inner.zip") {
+		t.Errorf("expected a WARNING mentioning the ignored nested zip, got: %s", logged)
+	}
+}
+
 // --- processItem: naming + sidecar, end to end (fake encoder) ----------
 
 func TestProcessItem_ZipMultiVideo_ProducesArtifactsAndSidecarsWithInheritedResourceID(t *testing.T) {
@@ -333,6 +439,68 @@ func TestProcessItem_ZipMultiVideo_ProducesArtifactsAndSidecarsWithInheritedReso
 	// The shared SourceFile (the zip) is marked done in history.
 	if !svc.history.Has("archive.zip") {
 		t.Errorf("expected history to contain the zip's SourceFile after successful processing")
+	}
+}
+
+// TestProcessItem_NestedVideoInZip_ProducesCanonicalArtifactFromBaseFilename
+// closes the loop end to end for the categorie-video-non-mappate backlog: a
+// video found deep in the extracted tree, under an unmapped category
+// ("materiale", per the backlog's owner decision), must still become a
+// canonical artifact + sidecar exactly like a top-level one, with the slug
+// derived from the entry's base filename only (the nested folders it lived
+// in inside the zip must not leak into the artifact name).
+func TestProcessItem_NestedVideoInZip_ProducesCanonicalArtifactFromBaseFilename(t *testing.T) {
+	tmpDir := t.TempDir()
+	zipPath := filepath.Join(tmpDir, "archive.zip")
+	extractDir := filepath.Join(tmpDir, "extract")
+
+	buildOrderedZip(t, zipPath, []zipEntry{
+		{name: "sub/deep/Interview Pt1.MP4", content: "video-one-bytes"},
+	})
+
+	item := fetcher.FileItem{
+		URL:        "https://example.com/download/archive.zip",
+		Filename:   "archive.zip",
+		ResourceID: 42,
+		Category:   "materiale",
+		Title:      "Serata di Luglio",
+	}
+
+	jobs, err := jobsForItem(item, zipPath, extractDir)
+	if err != nil {
+		t.Fatalf("jobsForItem() error = %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 job for the nested video, got %d: %+v", len(jobs), jobs)
+	}
+
+	svc := newTestService(t, &fakeEncoder{})
+	svc.processItem(jobs[0])
+
+	outDir := outputWeekDir(svc.cfg.OutputRoot)
+	artifact := "materiale_42_1_interview-pt1.mp4"
+	artifactPath := filepath.Join(outDir, artifact)
+
+	if _, err := os.Stat(artifactPath); err != nil {
+		t.Fatalf("expected canonical artifact for the nested video: %v", err)
+	}
+
+	raw, err := os.ReadFile(sidecar.PathFor(artifactPath))
+	if err != nil {
+		t.Fatalf("expected sidecar for the nested video artifact: %v", err)
+	}
+	var meta sidecar.Meta
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		t.Fatalf("sidecar is not valid JSON: %v", err)
+	}
+	if meta.OriginalFilename != "Interview Pt1.MP4" {
+		t.Errorf("sidecar OriginalFilename = %q, want base filename %q (nested folders must not leak in)", meta.OriginalFilename, "Interview Pt1.MP4")
+	}
+	if meta.Category != "materiale" {
+		t.Errorf("sidecar Category = %q, want %q (categories are open, adr-0008: no filter)", meta.Category, "materiale")
+	}
+	if meta.Artifact != artifact {
+		t.Errorf("sidecar Artifact = %q, want %q", meta.Artifact, artifact)
 	}
 }
 

@@ -189,9 +189,18 @@ func (s *Service) poll() {
 
 // jobsForItem turns a downloaded resource (item, already saved at
 // localPath) into the Jobs it produces. A zip is extracted into extractDir
-// and yields one Job per contained video file, in a 1-based progressive
-// Index order; non-video zip entries are ignored. A direct video file
-// yields exactly one Job with Index 1. Every Job inherits item's
+// and yields one Job per video file found ANYWHERE in the extracted tree
+// (extractor.ExtractAndClean walks every entry regardless of nesting depth
+// — a zip has no top level to stop at — so a video several subfolders deep
+// is found exactly like a top-level one; categorie-video-non-mappate
+// backlog, owner decision 2026-07-02: any category/any depth can carry
+// video, so there is no category filter here either), in a 1-based
+// progressive Index order that is stable/reproducible because
+// ExtractAndClean returns paths sorted, not in the archive's own
+// (unspecified) entry order. Non-video zip entries are ignored, including
+// nested zip entries (zip-in-zip is not supported: ExtractAndClean already
+// skips and logs those, so they never reach files here). A direct video
+// file yields exactly one Job with Index 1. Every Job inherits item's
 // ResourceID/Category/Title/URL (adr-0008).
 func jobsForItem(item fetcher.FileItem, localPath, extractDir string) ([]Job, error) {
 	ext := strings.ToLower(filepath.Ext(item.Filename))
