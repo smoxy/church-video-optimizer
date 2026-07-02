@@ -13,6 +13,8 @@ A high-efficiency, containerized microservice for automated video optimization u
   - Re-encodes to HEVC (H.265) by default.
   - Configurable quality (CRF) and preset.
 - **Structured Storage**: Organizes output by ISO Week (e.g., `2026-W05`).
+- **Provenance metadata**: every artifact is matched back to its source
+  resource by id, not by filename (see below).
 - **Resilient**: Graceful shutdown handling and error management.
 
 ## Project Structure
@@ -21,7 +23,46 @@ A high-efficiency, containerized microservice for automated video optimization u
 - `internal/app`: Service orchestration (Polling, Worker).
 - `internal/fetcher`: HTTP client and download logic.
 - `internal/extractor`: Zip extraction with "Zip Slip" protection.
-- `internal/processor`: FFmpeg wrapper.
+- `internal/processor`: FFmpeg wrapper (behind an `Encoder` interface so it
+  can be faked in tests).
+- `internal/naming`: Canonical artifact filename + slug generation.
+- `internal/sidecar`: Per-artifact `.meta.json` provenance sidecar.
+
+## Provenance metadata (matching per provenienza)
+
+Every polled resource carries `id`/`category`/`title` from the source API.
+Each video it produces (the file itself, or one extracted from a zip)
+inherits that provenance and is named:
+
+```
+{category}_{resource_id}_{n}_{slug}.mp4
+```
+
+`n` is a 1-based progressive index (a zip with several videos yields several
+artifacts); `slug` is a human-readable, `[a-z0-9-]`-only slug (max 40 chars)
+derived from the original filename, falling back to the resource title.
+
+Next to every artifact, once encoding succeeds, a sidecar
+`<artifact>.meta.json` is written atomically (temp file + rename in the same
+directory):
+
+```json
+{
+  "schema": 1,
+  "resource_id": 42,
+  "category": "vga",
+  "source_url": "https://...",
+  "original_filename": "nome interno allo zip.mp4",
+  "artifact": "vga_42_1_decime-luglio.mp4",
+  "size_bytes": 12345678,
+  "encoded_at": "2026-07-02T13:45:00Z",
+  "codec": "libx265",
+  "crf": 27
+}
+```
+
+Downstream consumers (mail-parser) match artifacts to resources by reading
+`resource_id` from the sidecar instead of parsing filenames.
 
 ## Configuration
 

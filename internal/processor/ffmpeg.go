@@ -16,6 +16,22 @@ type EncodeParams struct {
 	MaxThreads  int
 }
 
+// Encoder abstracts the actual transcoding step. Production code uses
+// FFmpegEncoder; tests can supply a fake implementation to exercise the
+// surrounding orchestration (naming, sidecar writing, dedup/history) without
+// invoking the real ffmpeg binary.
+type Encoder interface {
+	Encode(ctx context.Context, src, dest string, params EncodeParams) error
+}
+
+// FFmpegEncoder is the production Encoder: it shells out to ffmpeg via
+// ProcessVideo.
+type FFmpegEncoder struct{}
+
+func (FFmpegEncoder) Encode(ctx context.Context, src, dest string, params EncodeParams) error {
+	return ProcessVideo(ctx, src, dest, params)
+}
+
 // ProcessVideo runs ffmpeg to re-encode src to dest with given params
 func ProcessVideo(ctx context.Context, src, dest string, params EncodeParams) error {
 	args := []string{

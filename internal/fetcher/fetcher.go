@@ -22,6 +22,13 @@ import (
 type FileItem struct {
 	URL      string `json:"url"`
 	Filename string `json:"filename"`
+	// ResourceID, Category and Title carry the provenance of the resource
+	// this file was downloaded from (adr-0008 "matching per provenienza").
+	// Every video produced from this file (the file itself, or one of
+	// several extracted from a zip) inherits them.
+	ResourceID int    `json:"resource_id"`
+	Category   string `json:"category"`
+	Title      string `json:"title"`
 }
 
 // APIResponse matches the user provided JSON structure
@@ -101,8 +108,11 @@ func (f *Fetcher) Poll() ([]FileItem, error) {
 		}
 
 		fileItems = append(fileItems, FileItem{
-			URL:      res.DownloadURL,
-			Filename: filename,
+			URL:        res.DownloadURL,
+			Filename:   filename,
+			ResourceID: res.ID,
+			Category:   res.Category,
+			Title:      res.Title,
 		})
 	}
 
