@@ -83,6 +83,79 @@ func TestDeriveSlug(t *testing.T) {
 	}
 }
 
+func TestSanitizeCategory(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"already clean", "vga", "vga"},
+		{"uppercase", "VGA", "vga"},
+		{"path traversal dots and slashes", "../../etc/passwd", "etc-passwd"},
+		{"embedded slash", "foo/bar", "foo-bar"},
+		{"spaces and punctuation", "Video Generale Annuale!", "video-generale-annuale"},
+		{"url-breaking characters", "vga?x=1&y=2#z", "vga-x-1-y-2-z"},
+		{"empty falls back", "", FallbackCategory},
+		{"only invalid chars falls back", "../../../", FallbackCategory},
+		{"only punctuation falls back", "!!!___...", FallbackCategory},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := SanitizeCategory(c.in)
+			if got != c.want {
+				t.Errorf("SanitizeCategory(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+func TestSanitizeCategory_TruncatesLongInputToMaxLen(t *testing.T) {
+	long := strings.Repeat("c", 100)
+	got := SanitizeCategory(long)
+
+	want := strings.Repeat("c", MaxSlugLen)
+	if got != want {
+		t.Fatalf("SanitizeCategory(100 c's) = %q (len %d), want %q (len %d)", got, len(got), want, len(want))
+	}
+}
+
+func TestArtifactFilename_SanitizesUnsafeCategory(t *testing.T) {
+	cases := []struct {
+		name     string
+		category string
+		want     string
+	}{
+		{
+			"path traversal category can't escape the output directory",
+			"../../../etc/cron.d",
+			"etc-cron-d_1_1_slug.mp4",
+		},
+		{
+			"embedded slash can't introduce a URL/path segment",
+			"vga/../../etc",
+			"vga-etc_1_1_slug.mp4",
+		},
+		{
+			"empty category falls back instead of producing a malformed name",
+			"",
+			FallbackCategory + "_1_1_slug.mp4",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := ArtifactFilename(c.category, 1, 1, "slug")
+			if got != c.want {
+				t.Errorf("ArtifactFilename(%q, 1, 1, %q) = %q, want %q", c.category, "slug", got, c.want)
+			}
+			if strings.ContainsAny(got, "/\\") {
+				t.Errorf("ArtifactFilename(%q, ...) = %q contains a path separator", c.category, got)
+			}
+		})
+	}
+}
+
 func TestArtifactFilename(t *testing.T) {
 	cases := []struct {
 		name       string

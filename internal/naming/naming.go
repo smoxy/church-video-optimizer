@@ -24,6 +24,11 @@ const MaxSlugLen = 40
 // (uniqueness is still guaranteed by the {resource_id}_{n} prefix).
 const FallbackSlug = "video"
 
+// FallbackCategory is used when a resource's category has no sluggable
+// content, so the artifact name/URL stays well-formed (adr-0008 categories
+// are short machine codes, e.g. "vga", "gcv", "mis").
+const FallbackCategory = "misc"
+
 // accentFolder maps common accented Latin letters (Italian titles in
 // particular) to their plain ASCII equivalent. Slugify lowercases its input
 // first, so only lowercase accented runes need an entry here.
@@ -76,12 +81,30 @@ func DeriveSlug(originalFilename, fallbackTitle string) string {
 	return FallbackSlug
 }
 
+// SanitizeCategory restricts category to the same charset/length as Slugify
+// ([a-z0-9-], max MaxSlugLen). category comes straight from the source API
+// (contract-resources-api) and is untrusted: fed verbatim into
+// ArtifactFilename it would become both a filesystem path segment (the
+// caller joins the result onto OUTPUT_ROOT with filepath.Join, so a category
+// of e.g. "../../../etc/cron.d" would escape the output directory) and a
+// path component of the artifact's public URL on the served volume
+// (contract-video-volume). Falls back to FallbackCategory when nothing
+// sluggable survives.
+func SanitizeCategory(category string) string {
+	if s := Slugify(category); s != "" {
+		return s
+	}
+	return FallbackCategory
+}
+
 // ArtifactFilename builds the canonical artifact name (adr-0008):
 //
 //	{category}_{resource_id}_{n}_{slug}.mp4
 //
-// category and slug are used verbatim (callers are expected to pass an
-// already-sanitized slug, e.g. from DeriveSlug/Slugify).
+// category is sanitized internally (see SanitizeCategory) since it comes
+// straight from untrusted source-API input; slug is used verbatim (callers
+// are expected to pass an already-sanitized slug, e.g. from
+// DeriveSlug/Slugify).
 func ArtifactFilename(category string, resourceID, index int, slug string) string {
-	return fmt.Sprintf("%s_%d_%d_%s.mp4", category, resourceID, index, slug)
+	return fmt.Sprintf("%s_%d_%d_%s.mp4", SanitizeCategory(category), resourceID, index, slug)
 }
