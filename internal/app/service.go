@@ -32,6 +32,7 @@ type Job struct {
 	SourceURL        string // Resource download_url (sidecar source_url).
 	OriginalFilename string // Name of this specific video: the zip entry name, or the downloaded filename for a direct video (sidecar original_filename, slug source).
 	Index            int    // 1-based progressive index of this video within its resource (artifact naming "n").
+	WeekDate         string // Content week ("YYYY-MM-DD", source API week_date): drives the output week folder; empty on older servers → processing-week fallback.
 }
 
 type Service struct {
@@ -239,7 +240,27 @@ func newJob(item fetcher.FileItem, localPath, originalFilename string, index int
 		SourceURL:        item.URL,
 		OriginalFilename: originalFilename,
 		Index:            index,
+		WeekDate:         item.WeekDate,
 	}
+}
+
+// weekFolderName returns the "YYYY-Www" output folder for a job
+// (contract-video-volume): the ISO week of the CONTENT when weekDate (the
+// source API's additive `week_date` field, "YYYY-MM-DD") is present and
+// parsable, otherwise the ISO week of now (processing time). The fallback
+// keeps the rollout safe against source APIs that don't emit `week_date`
+// yet (older mail-parser): empty/invalid input degrades to the previous
+// behavior instead of failing. The boolean reports whether the fallback
+// was used, so the caller can log it explicitly.
+func weekFolderName(weekDate string, now time.Time) (string, bool) {
+	if weekDate != "" {
+		if d, err := time.Parse("2006-01-02", weekDate); err == nil {
+			year, week := d.ISOWeek()
+			return fmt.Sprintf("%d-W%02d", year, week), false
+		}
+	}
+	year, week := now.ISOWeek()
+	return fmt.Sprintf("%d-W%02d", year, week), true
 }
 
 func (s *Service) worker() {
@@ -259,9 +280,20 @@ func (s *Service) processItem(job Job) {
 	src := job.LocalPath
 	slog.Info("Processing file", "path", src, "resource_id", job.ResourceID, "category", job.Category, "index", job.Index)
 
-	// Determine output path: Root / Year-Wxx / filename
-	year, week := time.Now().ISOWeek()
-	folderName := fmt.Sprintf("%d-W%02d", year, week)
+	// Determine output path: Root / Year-Wxx / filename. The week is the
+	// CONTENT's week (job.WeekDate from the source API), not the processing
+	// week — falling back to time.Now() only when week_date is absent
+	// (older mail-parser) or unparsable (contract-video-volume).
+	folderName, usedFallback := weekFolderName(job.WeekDate, time.Now())
+	if usedFallback {
+		if job.WeekDate == "" {
+			slog.Info("week_date assente dal payload: fallback alla settimana di elaborazione",
+				"folder", folderName, "resource_id", job.ResourceID)
+		} else {
+			slog.Warn("week_date non parsabile (atteso YYYY-MM-DD): fallback alla settimana di elaborazione",
+				"week_date", job.WeekDate, "folder", folderName, "resource_id", job.ResourceID)
+		}
+	}
 	outDir := filepath.Join(s.cfg.OutputRoot, folderName)
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		slog.Error("Failed to create output directory", "dir", outDir, "error", err)

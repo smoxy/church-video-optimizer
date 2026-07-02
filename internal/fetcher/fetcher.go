@@ -29,6 +29,12 @@ type FileItem struct {
 	ResourceID int    `json:"resource_id"`
 	Category   string `json:"category"`
 	Title      string `json:"title"`
+	// WeekDate is the ISO date ("YYYY-MM-DD") of the CONTENT's week (the
+	// newsletter/resource week from the source API's additive `week_date`
+	// field, contract-resources-api). It drives the output week folder;
+	// empty when the source API doesn't emit it yet (older mail-parser),
+	// in which case processing falls back to the current week.
+	WeekDate string `json:"week_date"`
 }
 
 // APIResponse matches the user provided JSON structure
@@ -46,6 +52,11 @@ type Resource struct {
 	FileType    any    `json:"file_type"` // can be null
 	IsActive    bool   `json:"is_active"`
 	CreatedAt   string `json:"created_at"`
+	// WeekDate ("YYYY-MM-DD"): week of the CONTENT (newsletter week), NOT
+	// created_at (which is the producer's DB insert-time and diverges from
+	// the content's week whenever ingestion lags/recovers). Additive field
+	// (contract-resources-api): absent on older servers → empty string.
+	WeekDate string `json:"week_date"`
 }
 
 type Fetcher struct {
@@ -113,6 +124,7 @@ func (f *Fetcher) Poll() ([]FileItem, error) {
 			ResourceID: res.ID,
 			Category:   res.Category,
 			Title:      res.Title,
+			WeekDate:   res.WeekDate,
 		})
 	}
 

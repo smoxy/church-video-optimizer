@@ -94,3 +94,43 @@ func TestDownload_HEADNon200Status_ReturnsError(t *testing.T) {
 		t.Fatal("Download() error = nil, want an error for a 404 HEAD response")
 	}
 }
+
+// TestPoll_WeekDatePropagation pins the additive week_date contract
+// (contract-resources-api): when the source API emits `week_date` (content
+// week) it must reach FileItem verbatim, and when it's absent (older
+// mail-parser) FileItem.WeekDate must be the empty string — the zero value
+// downstream code treats as "use the processing-week fallback".
+func TestPoll_WeekDatePropagation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"count": 2,
+			"resources": [
+				{"id": 42, "category": "vga", "title": "Con week_date",
+				 "download_url": "https://cdn.example.com/files/archive.zip",
+				 "is_active": true, "created_at": "2026-07-02T10:00:00Z",
+				 "week_date": "2026-05-09"},
+				{"id": 43, "category": "mis", "title": "Server vecchio senza week_date",
+				 "download_url": "https://cdn.example.com/files/video.mp4",
+				 "is_active": true, "created_at": "2026-07-02T10:00:00Z"}
+			]
+		}`))
+	}))
+	defer srv.Close()
+
+	f := &Fetcher{Endpoint: srv.URL, PollClient: srv.Client()}
+	items, err := f.Poll()
+	if err != nil {
+		t.Fatalf("Poll() error = %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("Poll() returned %d items, want 2", len(items))
+	}
+
+	if items[0].ResourceID != 42 || items[0].WeekDate != "2026-05-09" {
+		t.Errorf("item[0] = %+v, want ResourceID 42 with WeekDate %q", items[0], "2026-05-09")
+	}
+	if items[1].ResourceID != 43 || items[1].WeekDate != "" {
+		t.Errorf("item[1] = %+v, want ResourceID 43 with empty WeekDate (additive field absent)", items[1])
+	}
+}

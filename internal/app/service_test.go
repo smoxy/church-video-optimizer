@@ -113,6 +113,144 @@ func outputWeekDir(root string) string {
 	return filepath.Join(root, fmt.Sprintf("%d-W%02d", year, week))
 }
 
+// --- weekFolderName: content week vs processing week (fallback) ---------
+
+func TestWeekFolderName_ContentWeekAndFallback(t *testing.T) {
+	// Fixed "now" in ISO week 2026-W27, distinct from every content week
+	// used below, so content-vs-processing mixups can't pass by accident.
+	now := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name         string
+		weekDate     string
+		wantFolder   string
+		wantFallback bool
+	}{
+		{
+			name:     "valid content week drives the folder (W19, maggio)",
+			weekDate: "2026-05-09", wantFolder: "2026-W19", wantFallback: false,
+		},
+		{
+			name:     "ISO week-year boundary: Dec 29 2025 is 2026-W01",
+			weekDate: "2025-12-29", wantFolder: "2026-W01", wantFallback: false,
+		},
+		{
+			name:     "empty week_date (older mail-parser): processing-week fallback",
+			weekDate: "", wantFolder: "2026-W27", wantFallback: true,
+		},
+		{
+			name:     "unparsable week_date: processing-week fallback, no error",
+			weekDate: "not-a-date", wantFolder: "2026-W27", wantFallback: true,
+		},
+		{
+			name:     "wrong layout (DD/MM/YYYY): processing-week fallback",
+			weekDate: "09/05/2026", wantFolder: "2026-W27", wantFallback: true,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			folder, usedFallback := weekFolderName(c.weekDate, now)
+			if folder != c.wantFolder {
+				t.Errorf("weekFolderName(%q) folder = %q, want %q", c.weekDate, folder, c.wantFolder)
+			}
+			if usedFallback != c.wantFallback {
+				t.Errorf("weekFolderName(%q) usedFallback = %v, want %v", c.weekDate, usedFallback, c.wantFallback)
+			}
+		})
+	}
+}
+
+// TestProcessItem_WeekDate_ArtifactLandsInContentWeekFolder is the
+// end-to-end guard for the week-folder drift fix (backlog drift-noti): a
+// job carrying the content's week_date (a May/W19 resource processed
+// months later) must produce its artifact+sidecar under the CONTENT's week
+// folder, not under time.Now()'s.
+func TestProcessItem_WeekDate_ArtifactLandsInContentWeekFolder(t *testing.T) {
+	tmpDir := t.TempDir()
+	videoPath := filepath.Join(tmpDir, "clip.mp4")
+	if err := os.WriteFile(videoPath, []byte("video-bytes"), 0644); err != nil {
+		t.Fatalf("failed to write fake video: %v", err)
+	}
+
+	item := fetcher.FileItem{
+		URL:        "https://example.com/download/clip.mp4",
+		Filename:   "clip.mp4",
+		ResourceID: 7,
+		Category:   "vga",
+		Title:      "Risorsa di maggio",
+		WeekDate:   "2026-05-09", // ISO week 2026-W19
+	}
+	jobs, err := jobsForItem(item, videoPath, tmpDir)
+	if err != nil {
+		t.Fatalf("jobsForItem() error = %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].WeekDate != "2026-05-09" {
+		t.Fatalf("expected 1 job inheriting WeekDate, got %+v", jobs)
+	}
+
+	svc := newTestService(t, &fakeEncoder{})
+	svc.processItem(jobs[0])
+
+	contentDir := filepath.Join(svc.cfg.OutputRoot, "2026-W19")
+	artifact := filepath.Join(contentDir, "vga_7_1_clip.mp4")
+	if _, err := os.Stat(artifact); err != nil {
+		t.Fatalf("expected artifact in content-week folder %q: %v", contentDir, err)
+	}
+	if _, err := os.Stat(sidecar.PathFor(artifact)); err != nil {
+		t.Fatalf("expected sidecar next to artifact in content-week folder: %v", err)
+	}
+
+	// And nothing leaked into the processing-week folder (skip the check in
+	// the vanishingly unlikely case the test actually runs in 2026-W19).
+	if nowDir := outputWeekDir(svc.cfg.OutputRoot); nowDir != contentDir {
+		if _, err := os.Stat(nowDir); !os.IsNotExist(err) {
+			t.Errorf("processing-week folder %q should not exist, stat err: %v", nowDir, err)
+		}
+	}
+}
+
+// TestProcessItem_NoWeekDate_FallsBackToProcessingWeekAndLogs pins the
+// rollout-safety contract: against an older mail-parser that doesn't emit
+// week_date yet, processing must keep working exactly as before (artifact
+// under time.Now()'s week folder) and say so in the logs.
+func TestProcessItem_NoWeekDate_FallsBackToProcessingWeekAndLogs(t *testing.T) {
+	var logBuf bytes.Buffer
+	restore := captureSlog(&logBuf)
+	defer restore()
+
+	tmpDir := t.TempDir()
+	videoPath := filepath.Join(tmpDir, "clip.mp4")
+	if err := os.WriteFile(videoPath, []byte("video-bytes"), 0644); err != nil {
+		t.Fatalf("failed to write fake video: %v", err)
+	}
+
+	item := fetcher.FileItem{
+		URL:        "https://example.com/download/clip.mp4",
+		Filename:   "clip.mp4",
+		ResourceID: 7,
+		Category:   "vga",
+		Title:      "Senza week_date",
+		// WeekDate deliberately empty: server pre-week_date.
+	}
+	jobs, err := jobsForItem(item, videoPath, tmpDir)
+	if err != nil {
+		t.Fatalf("jobsForItem() error = %v", err)
+	}
+
+	svc := newTestService(t, &fakeEncoder{})
+	svc.processItem(jobs[0])
+
+	artifact := filepath.Join(outputWeekDir(svc.cfg.OutputRoot), "vga_7_1_clip.mp4")
+	if _, err := os.Stat(artifact); err != nil {
+		t.Fatalf("expected artifact in processing-week folder (fallback): %v", err)
+	}
+
+	if !strings.Contains(logBuf.String(), "fallback alla settimana di elaborazione") {
+		t.Errorf("expected an explicit fallback log line, got logs:\n%s", logBuf.String())
+	}
+}
+
 // --- jobsForItem: resource metadata inheritance (adr-0008) -------------
 
 func TestJobsForItem_ZipMultiVideo_InheritsResourceMetadataWithProgressiveIndex(t *testing.T) {
