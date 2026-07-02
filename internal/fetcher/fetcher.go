@@ -22,6 +22,13 @@ import (
 type FileItem struct {
 	URL      string `json:"url"`
 	Filename string `json:"filename"`
+	// ResourceID, Category and Title carry the provenance of the resource
+	// this file was downloaded from (adr-0008 "matching per provenienza").
+	// Every video produced from this file (the file itself, or one of
+	// several extracted from a zip) inherits them.
+	ResourceID int    `json:"resource_id"`
+	Category   string `json:"category"`
+	Title      string `json:"title"`
 }
 
 // APIResponse matches the user provided JSON structure
@@ -101,8 +108,11 @@ func (f *Fetcher) Poll() ([]FileItem, error) {
 		}
 
 		fileItems = append(fileItems, FileItem{
-			URL:      res.DownloadURL,
-			Filename: filename,
+			URL:        res.DownloadURL,
+			Filename:   filename,
+			ResourceID: res.ID,
+			Category:   res.Category,
+			Title:      res.Title,
 		})
 	}
 
@@ -122,7 +132,18 @@ func (f *Fetcher) Download(urlStr string, dest string) error {
 	}
 	headResp.Body.Close()
 
-	if headResp.StatusCode != http.StatusOK && headResp.StatusCode != http.StatusPartialContent {
+	// This HEAD request carries no Range header, so per RFC 7233 §4.1 a
+	// compliant server must never answer 206 Partial Content (206 is only
+	// legal in response to a Range request); a server/proxy/CDN that does
+	// it anyway is misbehaving. Accepting it here would also be unsafe on
+	// its own terms: ContentLength on a 206 is the size of whatever range
+	// the server unilaterally chose to return, not of the full resource,
+	// and this code never parses Content-Range to recover the real total.
+	// Trusting that number as totalSize would silently truncate/corrupt the
+	// file via downloadConcurrent's chunk math and file.Truncate. So we
+	// restrict success to exactly 200 and fail fast on anything else,
+	// including 206, instead of guessing.
+	if headResp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HEAD request failed: %d", headResp.StatusCode)
 	}
 

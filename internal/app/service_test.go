@@ -1,0 +1,374 @@
+package app
+
+import (
+	"archive/zip"
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"video-optimizer/internal/config"
+	"video-optimizer/internal/fetcher"
+	"video-optimizer/internal/processor"
+	"video-optimizer/internal/sidecar"
+)
+
+// --- test helpers -----------------------------------------------------
+
+// zipEntry is one file to write into a test archive.
+type zipEntry struct {
+	name    string
+	content string
+}
+
+// buildOrderedZip creates a zip archive at dest with one entry per element
+// of entries, written in slice order. Unlike a map-based builder, this
+// keeps entry order deterministic, which matters for asserting on the
+// progressive "n" index assigned per adr-0008.
+func buildOrderedZip(t *testing.T, dest string, entries []zipEntry) {
+	t.Helper()
+
+	f, err := os.Create(dest)
+	if err != nil {
+		t.Fatalf("failed to create zip: %v", err)
+	}
+	defer f.Close()
+
+	zw := zip.NewWriter(f)
+	for _, e := range entries {
+		w, err := zw.Create(e.name)
+		if err != nil {
+			t.Fatalf("failed to add zip entry %q: %v", e.name, err)
+		}
+		if _, err := w.Write([]byte(e.content)); err != nil {
+			t.Fatalf("failed to write zip entry %q: %v", e.name, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("failed to close zip writer: %v", err)
+	}
+}
+
+// captureSlog redirects the default slog logger to buf and returns a
+// restore func to put the previous default back (call via defer/t.Cleanup).
+func captureSlog(buf *bytes.Buffer) func() {
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, nil)))
+	return func() { slog.SetDefault(prev) }
+}
+
+// fakeEncoder is a processor.Encoder that never shells out to ffmpeg: it
+// simulates a successful encode by writing deterministic placeholder bytes
+// to dest (so size_bytes assertions are meaningful), or returns a
+// pre-configured error to simulate an encoding failure.
+type fakeEncoder struct {
+	err error
+}
+
+func (f *fakeEncoder) Encode(_ context.Context, src, dest string, _ processor.EncodeParams) error {
+	if f.err != nil {
+		return f.err
+	}
+	content := fmt.Sprintf("fake-encoded:%s", filepath.Base(src))
+	return os.WriteFile(dest, []byte(content), 0644)
+}
+
+// newTestService builds a Service suitable for exercising processItem
+// directly (bypassing NewService, which wires up a real fetcher.Fetcher and
+// an async cleanup goroutine that are irrelevant here).
+func newTestService(t *testing.T, enc processor.Encoder) *Service {
+	t.Helper()
+
+	root := t.TempDir()
+	cfg := &config.Config{
+		OutputRoot:  root,
+		VideoCodec:  "libx265",
+		VideoCRF:    27,
+		VideoPreset: "medium",
+		AudioCodec:  "aac",
+	}
+
+	hist, err := NewHistory(filepath.Join(root, "processed.json"))
+	if err != nil {
+		t.Fatalf("NewHistory: %v", err)
+	}
+
+	return &Service{
+		cfg:        cfg,
+		encoder:    enc,
+		history:    hist,
+		downloaded: make(map[string]bool),
+		ctx:        context.Background(),
+	}
+}
+
+func outputWeekDir(root string) string {
+	year, week := time.Now().ISOWeek()
+	return filepath.Join(root, fmt.Sprintf("%d-W%02d", year, week))
+}
+
+// --- jobsForItem: resource metadata inheritance (adr-0008) -------------
+
+func TestJobsForItem_ZipMultiVideo_InheritsResourceMetadataWithProgressiveIndex(t *testing.T) {
+	tmpDir := t.TempDir()
+	zipPath := filepath.Join(tmpDir, "archive.zip")
+	extractDir := filepath.Join(tmpDir, "extract")
+
+	buildOrderedZip(t, zipPath, []zipEntry{
+		{name: "Interview Pt1.MP4", content: "video-one"},
+		{name: "cover.jpg", content: "not-a-video"}, // must be ignored
+		{name: "seconda parte.mkv", content: "video-two"},
+	})
+
+	item := fetcher.FileItem{
+		URL:        "https://example.com/download/archive.zip",
+		Filename:   "archive.zip",
+		ResourceID: 42,
+		Category:   "vga",
+		Title:      "Serata VGA di Luglio",
+	}
+
+	jobs, err := jobsForItem(item, zipPath, extractDir)
+	if err != nil {
+		t.Fatalf("jobsForItem() error = %v", err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("expected 2 jobs (non-video entry ignored), got %d: %+v", len(jobs), jobs)
+	}
+
+	want := []Job{
+		{
+			SourceFile: "archive.zip", LocalPath: filepath.Join(extractDir, "Interview Pt1.MP4"),
+			ResourceID: 42, Category: "vga", Title: "Serata VGA di Luglio",
+			SourceURL: item.URL, OriginalFilename: "Interview Pt1.MP4", Index: 1,
+		},
+		{
+			SourceFile: "archive.zip", LocalPath: filepath.Join(extractDir, "seconda parte.mkv"),
+			ResourceID: 42, Category: "vga", Title: "Serata VGA di Luglio",
+			SourceURL: item.URL, OriginalFilename: "seconda parte.mkv", Index: 2,
+		},
+	}
+	for i := range want {
+		if jobs[i] != want[i] {
+			t.Errorf("job[%d] = %+v, want %+v", i, jobs[i], want[i])
+		}
+	}
+
+	// extractor.ExtractAndClean removes the source zip after extraction.
+	if _, err := os.Stat(zipPath); !os.IsNotExist(err) {
+		t.Errorf("expected zip to be removed after extraction, stat err: %v", err)
+	}
+}
+
+func TestJobsForItem_DirectVideo_SingleJobIndex1(t *testing.T) {
+	tmpDir := t.TempDir()
+	videoPath := filepath.Join(tmpDir, "clip.mp4")
+	if err := os.WriteFile(videoPath, []byte("video-bytes"), 0644); err != nil {
+		t.Fatalf("failed to write fake video: %v", err)
+	}
+
+	item := fetcher.FileItem{
+		URL:        "https://example.com/d/clip.mp4",
+		Filename:   "clip.mp4",
+		ResourceID: 7,
+		Category:   "gcv",
+		Title:      "Prima Decima",
+	}
+
+	jobs, err := jobsForItem(item, videoPath, tmpDir)
+	if err != nil {
+		t.Fatalf("jobsForItem() error = %v", err)
+	}
+
+	want := Job{
+		SourceFile: "clip.mp4", LocalPath: videoPath,
+		ResourceID: 7, Category: "gcv", Title: "Prima Decima",
+		SourceURL: item.URL, OriginalFilename: "clip.mp4", Index: 1,
+	}
+	if len(jobs) != 1 || jobs[0] != want {
+		t.Fatalf("jobsForItem() = %+v, want [%+v]", jobs, want)
+	}
+}
+
+func TestJobsForItem_ZipWithoutVideos_SkipsAndLogsWarning(t *testing.T) {
+	tmpDir := t.TempDir()
+	zipPath := filepath.Join(tmpDir, "docs.zip")
+	extractDir := filepath.Join(tmpDir, "extract")
+
+	buildOrderedZip(t, zipPath, []zipEntry{
+		{name: "readme.txt", content: "hello"},
+		{name: "cover.jpg", content: "image-bytes"},
+	})
+
+	item := fetcher.FileItem{
+		URL: "https://example.com/d/docs.zip", Filename: "docs.zip",
+		ResourceID: 1, Category: "vga",
+	}
+
+	var logBuf bytes.Buffer
+	defer captureSlog(&logBuf)()
+
+	jobs, err := jobsForItem(item, zipPath, extractDir)
+	if err != nil {
+		t.Fatalf("jobsForItem() error = %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("expected 0 jobs for a zip without videos, got %d: %+v", len(jobs), jobs)
+	}
+
+	logged := logBuf.String()
+	if !strings.Contains(logged, "WARN") {
+		t.Errorf("expected a WARNING to be logged, got: %s", logged)
+	}
+	if !strings.Contains(logged, "docs.zip") {
+		t.Errorf("expected the WARNING to mention the zip filename, got: %s", logged)
+	}
+}
+
+// --- processItem: naming + sidecar, end to end (fake encoder) ----------
+
+func TestProcessItem_ZipMultiVideo_ProducesArtifactsAndSidecarsWithInheritedResourceID(t *testing.T) {
+	tmpDir := t.TempDir()
+	zipPath := filepath.Join(tmpDir, "archive.zip")
+	extractDir := filepath.Join(tmpDir, "extract")
+
+	buildOrderedZip(t, zipPath, []zipEntry{
+		{name: "Interview Pt1.MP4", content: "video-one-bytes"},
+		{name: "seconda parte.mkv", content: "video-two-bytes-a-bit-longer"},
+	})
+
+	item := fetcher.FileItem{
+		URL:        "https://example.com/download/archive.zip",
+		Filename:   "archive.zip",
+		ResourceID: 42,
+		Category:   "vga",
+		Title:      "Serata VGA di Luglio",
+	}
+
+	jobs, err := jobsForItem(item, zipPath, extractDir)
+	if err != nil {
+		t.Fatalf("jobsForItem() error = %v", err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("expected 2 jobs, got %d", len(jobs))
+	}
+
+	svc := newTestService(t, &fakeEncoder{})
+	for _, job := range jobs {
+		svc.processItem(job)
+	}
+
+	outDir := outputWeekDir(svc.cfg.OutputRoot)
+
+	cases := []struct {
+		artifact         string
+		originalFilename string
+	}{
+		{"vga_42_1_interview-pt1.mp4", "Interview Pt1.MP4"},
+		{"vga_42_2_seconda-parte.mp4", "seconda parte.mkv"},
+	}
+
+	for _, c := range cases {
+		artifactPath := filepath.Join(outDir, c.artifact)
+		info, err := os.Stat(artifactPath)
+		if err != nil {
+			t.Fatalf("expected artifact %q: %v", c.artifact, err)
+		}
+
+		raw, err := os.ReadFile(sidecar.PathFor(artifactPath))
+		if err != nil {
+			t.Fatalf("expected sidecar for %q: %v", c.artifact, err)
+		}
+		var meta sidecar.Meta
+		if err := json.Unmarshal(raw, &meta); err != nil {
+			t.Fatalf("sidecar for %q is not valid JSON: %v", c.artifact, err)
+		}
+
+		if meta.Schema != sidecar.SchemaVersion {
+			t.Errorf("%s: sidecar Schema = %d, want %d", c.artifact, meta.Schema, sidecar.SchemaVersion)
+		}
+		if meta.ResourceID != 42 {
+			t.Errorf("%s: sidecar ResourceID = %d, want 42 (inherited from the zip's resource)", c.artifact, meta.ResourceID)
+		}
+		if meta.Category != "vga" {
+			t.Errorf("%s: sidecar Category = %q, want %q", c.artifact, meta.Category, "vga")
+		}
+		if meta.SourceURL != item.URL {
+			t.Errorf("%s: sidecar SourceURL = %q, want %q", c.artifact, meta.SourceURL, item.URL)
+		}
+		if meta.OriginalFilename != c.originalFilename {
+			t.Errorf("%s: sidecar OriginalFilename = %q, want %q", c.artifact, meta.OriginalFilename, c.originalFilename)
+		}
+		if meta.Artifact != c.artifact {
+			t.Errorf("%s: sidecar Artifact = %q, want %q", c.artifact, meta.Artifact, c.artifact)
+		}
+		if meta.SizeBytes != info.Size() {
+			t.Errorf("%s: sidecar SizeBytes = %d, want %d (actual artifact size)", c.artifact, meta.SizeBytes, info.Size())
+		}
+		if meta.Codec != "libx265" || meta.CRF != 27 {
+			t.Errorf("%s: sidecar Codec/CRF = %s/%d, want libx265/27", c.artifact, meta.Codec, meta.CRF)
+		}
+		if _, err := time.Parse(time.RFC3339, meta.EncodedAt); err != nil {
+			t.Errorf("%s: sidecar EncodedAt = %q is not ISO8601/RFC3339: %v", c.artifact, meta.EncodedAt, err)
+		}
+
+		if perm := info.Mode().Perm(); perm != 0644 {
+			t.Errorf("%s: artifact permissions = %v, want 0644", c.artifact, perm)
+		}
+	}
+
+	// Both extracted sources are consumed once their job succeeds.
+	for _, job := range jobs {
+		if _, err := os.Stat(job.LocalPath); !os.IsNotExist(err) {
+			t.Errorf("expected source %q to be removed after successful processing", job.LocalPath)
+		}
+	}
+
+	// The shared SourceFile (the zip) is marked done in history.
+	if !svc.history.Has("archive.zip") {
+		t.Errorf("expected history to contain the zip's SourceFile after successful processing")
+	}
+}
+
+func TestProcessItem_EncodeFailure_NoOrphanArtifactOrSidecar(t *testing.T) {
+	tmpDir := t.TempDir()
+	srcPath := filepath.Join(tmpDir, "clip.mp4")
+	if err := os.WriteFile(srcPath, []byte("source-bytes"), 0644); err != nil {
+		t.Fatalf("failed to write fake source: %v", err)
+	}
+
+	job := Job{
+		SourceFile: "clip.mp4", LocalPath: srcPath,
+		ResourceID: 9, Category: "mis", Title: "Missione",
+		SourceURL: "https://example.com/clip.mp4", OriginalFilename: "clip.mp4", Index: 1,
+	}
+
+	svc := newTestService(t, &fakeEncoder{err: fmt.Errorf("boom")})
+	svc.downloaded[job.SourceFile] = true
+
+	svc.processItem(job)
+
+	artifactPath := filepath.Join(outputWeekDir(svc.cfg.OutputRoot), "mis_9_1_clip.mp4")
+
+	if _, err := os.Stat(artifactPath); !os.IsNotExist(err) {
+		t.Errorf("expected no artifact after encode failure, stat err: %v", err)
+	}
+	if _, err := os.Stat(sidecar.PathFor(artifactPath)); !os.IsNotExist(err) {
+		t.Errorf("expected no sidecar after encode failure, stat err: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(svc.cfg.OutputRoot, "failed", "clip.mp4")); err != nil {
+		t.Errorf("expected source to be moved to failed/: %v", err)
+	}
+	if svc.history.Has("clip.mp4") {
+		t.Errorf("a failed job must not be marked done in history")
+	}
+	if svc.downloaded["clip.mp4"] {
+		t.Errorf("expected the session dedup flag to be cleared after failure (allow retry on next poll)")
+	}
+}
